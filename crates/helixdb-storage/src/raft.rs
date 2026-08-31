@@ -15,6 +15,7 @@ pub struct RaftConfig {
     pub election_timeout_max: Duration,
     pub heartbeat_interval: Duration,
     pub rpc_timeout: Duration,
+    pub snapshot_threshold_entries: usize,
 }
 
 impl Default for RaftConfig {
@@ -24,6 +25,7 @@ impl Default for RaftConfig {
             election_timeout_max: Duration::from_millis(400),
             heartbeat_interval: Duration::from_millis(50),
             rpc_timeout: Duration::from_millis(200),
+            snapshot_threshold_entries: 64,
         }
     }
 }
@@ -44,6 +46,8 @@ pub struct RaftNodeState {
     pub leader_id: Option<u64>,
     pub commit_index: u64,
     pub last_applied: u64,
+    pub snapshot_index: u64,
+    pub snapshot_term: u64,
     pub log_len: usize,
     pub kv_len: usize,
 }
@@ -110,6 +114,8 @@ struct NodeState {
     log: Vec<LogEntry>,
     commit_index: u64,
     last_applied: u64,
+    snapshot_index: u64,
+    snapshot_term: u64,
     kv: BTreeMap<Vec<u8>, Vec<u8>>,
     next_index: BTreeMap<u64, u64>,
     match_index: BTreeMap<u64, u64>,
@@ -135,6 +141,14 @@ enum Rpc {
         leader_commit: u64,
         respond_to: Sender<AppendResponse>,
     },
+    InstallSnapshot {
+        term: u64,
+        leader_id: u64,
+        last_included_index: u64,
+        last_included_term: u64,
+        snapshot: SnapshotData,
+        respond_to: Sender<InstallSnapshotResponse>,
+    },
     Propose {
         command: Command,
         respond_to: Sender<ProposeResponse>,
@@ -155,11 +169,38 @@ struct AppendResponse {
     match_index: u64,
 }
 
+#[derive(Debug, Clone)]
+struct InstallSnapshotResponse {
+    term: u64,
+    success: bool,
+    last_included_index: u64,
+}
+
 #[derive(Debug)]
 struct ProposeResponse {
     term: u64,
     success: bool,
     index: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotData {
+    key_values: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+enum ReplicationAction {
+    Append {
+        prev_index: u64,
+        prev_term: u64,
+        entries: Vec<LogEntry>,
+        leader_commit: u64,
+    },
+    InstallSnapshot {
+        snapshot: SnapshotData,
+        last_included_index: u64,
+        last_included_term: u64,
+        leader_commit: u64,
+    },
 }
 
 pub struct RaftCluster {
@@ -434,19 +475,24 @@ impl NodeState {
             leader_id: None,
             log: disk.log,
             commit_index: disk.meta.commit_index,
-            last_applied: 0,
-            kv: BTreeMap::new(),
+            last_applied: disk.snapshot.last_included_index,
+            snapshot_index: disk.snapshot.last_included_index,
+            snapshot_term: disk.snapshot.last_included_term,
+            kv: disk.snapshot.key_values,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
             election_deadline: Instant::now(),
             heartbeat_due: Instant::now(),
         };
 
+        if state.commit_index < state.snapshot_index {
+            state.commit_index = state.snapshot_index;
+        }
         let last_index = state.last_log_index();
         if state.commit_index > last_index {
             state.commit_index = last_index;
         }
-        state.rebuild_state_machine();
+        state.apply_committed_entries();
         state.reset_election_deadline();
         state.heartbeat_due = Instant::now() + state.config.heartbeat_interval;
         Ok(state)
@@ -461,7 +507,11 @@ impl NodeState {
             leader_id: self.leader_id,
             commit_index: self.commit_index,
             last_applied: self.last_applied,
-            log_len: self.log.len().saturating_sub(1),
+            snapshot_index: self.snapshot_index,
+            snapshot_term: self.snapshot_term,
+            log_len: self
+                .last_log_index()
+                .saturating_sub(self.snapshot_index) as usize,
             kv_len: self.kv.len(),
         }
     }
@@ -471,11 +521,27 @@ impl NodeState {
     }
 
     fn last_log_index(&self) -> u64 {
-        self.log.len().saturating_sub(1) as u64
+        if self.log.len() <= 1 {
+            self.snapshot_index
+        } else {
+            self.log.last().map(|entry| entry.index).unwrap_or(self.snapshot_index)
+        }
     }
 
     fn last_log_term(&self) -> u64 {
-        self.log.last().map(|entry| entry.term).unwrap_or(0)
+        if self.log.len() <= 1 {
+            self.snapshot_term
+        } else {
+            self.log.last().map(|entry| entry.term).unwrap_or(self.snapshot_term)
+        }
+    }
+
+    fn entry_at(&self, index: u64) -> Option<&LogEntry> {
+        if index <= self.snapshot_index {
+            return None;
+        }
+
+        self.log.iter().skip(1).find(|entry| entry.index == index)
     }
 
     fn reset_election_deadline(&mut self) {
@@ -520,21 +586,10 @@ impl NodeState {
         self.heartbeat_due = Instant::now();
     }
 
-    fn rebuild_state_machine(&mut self) {
-        self.kv.clear();
-        self.last_applied = 0;
-        for index in 1..=self.commit_index {
-            if let Some(entry) = self.log.get(index as usize).cloned() {
-                self.apply_entry(&entry);
-                self.last_applied = index;
-            }
-        }
-    }
-
     fn apply_committed_entries(&mut self) {
         while self.last_applied < self.commit_index {
             let next = self.last_applied + 1;
-            if let Some(entry) = self.log.get(next as usize).cloned() {
+            if let Some(entry) = self.entry_at(next).cloned() {
                 self.apply_entry(&entry);
                 self.last_applied = next;
             } else {
@@ -555,7 +610,86 @@ impl NodeState {
     }
 
     fn persist(&self) -> Result<()> {
-        persist_disk_state(&self.dir, self.current_term, self.voted_for, self.commit_index, &self.log)
+        persist_disk_state(
+            &self.dir,
+            self.current_term,
+            self.voted_for,
+            self.commit_index,
+            &self.log,
+        )
+    }
+
+    fn persist_snapshot(&self) -> Result<()> {
+        persist_snapshot_state(
+            &self.dir.join("raft.snapshot"),
+            self.snapshot_index,
+            self.snapshot_term,
+            &self.kv,
+        )
+    }
+
+    fn maybe_snapshot(&mut self) -> Result<()> {
+        let snapshot = self.commit_index;
+        if snapshot <= self.snapshot_index {
+            return Ok(());
+        }
+
+        let threshold = self.config.snapshot_threshold_entries.max(1) as u64;
+        if self.last_log_index().saturating_sub(self.snapshot_index) < threshold {
+            return Ok(());
+        }
+
+        self.create_snapshot(snapshot)
+    }
+
+    fn create_snapshot(&mut self, last_included_index: u64) -> Result<()> {
+        if last_included_index <= self.snapshot_index {
+            return Ok(());
+        }
+
+        let last_included_term = if last_included_index == 0 {
+            0
+        } else {
+            self.entry_at(last_included_index)
+                .map(|entry| entry.term)
+                .unwrap_or(self.snapshot_term)
+        };
+
+        self.snapshot_index = last_included_index;
+        self.snapshot_term = last_included_term;
+
+        self.log = compact_log_entries(&self.log, self.snapshot_index);
+        if self.last_applied < self.snapshot_index {
+            self.last_applied = self.snapshot_index;
+        }
+        if self.commit_index < self.snapshot_index {
+            self.commit_index = self.snapshot_index;
+        }
+        self.persist_snapshot()?;
+        self.persist()?;
+        Ok(())
+    }
+
+    fn install_snapshot(&mut self, snapshot: SnapshotState) -> Result<()> {
+        if snapshot.last_included_index < self.snapshot_index {
+            return Ok(());
+        }
+
+        let snapshot_path = self.dir.join("raft.snapshot");
+        let snapshot_index = snapshot.last_included_index;
+        let snapshot_term = snapshot.last_included_term;
+        let snapshot_key_values = snapshot.key_values;
+        self.snapshot_index = snapshot.last_included_index;
+        self.snapshot_term = snapshot.last_included_term;
+        self.kv = snapshot_key_values.clone();
+        self.log = compact_log_entries(&self.log, self.snapshot_index);
+        self.last_applied = self.snapshot_index;
+        if self.commit_index < self.snapshot_index {
+            self.commit_index = self.snapshot_index;
+        }
+        persist_snapshot_state(&snapshot_path, snapshot_index, snapshot_term, &snapshot_key_values)?;
+        self.persist()?;
+        Ok(())
     }
 }
 
@@ -630,6 +764,24 @@ fn run_node(
                     prev_log_term,
                     entries,
                     leader_commit,
+                )?;
+                let _ = respond_to.send(response);
+            }
+            Ok(Rpc::InstallSnapshot {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                snapshot,
+                respond_to,
+            }) => {
+                let response = handle_install_snapshot(
+                    &state,
+                    term,
+                    leader_id,
+                    last_included_index,
+                    last_included_term,
+                    snapshot,
                 )?;
                 let _ = respond_to.send(response);
             }
@@ -759,7 +911,7 @@ fn send_heartbeats(
     bus: &Arc<ClusterBus>,
     config: &RaftConfig,
 ) -> Result<()> {
-    let (term, id, peers, prev_index, prev_term, leader_commit) = {
+    let (term, id, peers) = {
         let state = state.lock().unwrap();
         if state.role != RaftRole::Leader {
             return Ok(());
@@ -768,24 +920,11 @@ fn send_heartbeats(
             state.current_term,
             state.id,
             state.peers.clone(),
-            state.last_log_index(),
-            state.last_log_term(),
-            state.commit_index,
         )
     };
 
     for peer in peers {
-        let _ = call_append_entries(
-            bus,
-            peer,
-            term,
-            id,
-            prev_index,
-            prev_term,
-            Vec::new(),
-            leader_commit,
-            config.rpc_timeout,
-        )?;
+        let _ = replicate_peer_with_retry(state, bus, peer, term, id, config)?;
     }
 
     Ok(())
@@ -860,6 +999,14 @@ fn handle_append_entries(
     state.leader_id = Some(leader_id);
     state.reset_election_deadline();
 
+    if prev_log_index < state.snapshot_index {
+        return Ok(AppendResponse {
+            term: state.current_term,
+            success: false,
+            match_index: state.snapshot_index,
+        });
+    }
+
     if prev_log_index > state.last_log_index() {
         return Ok(AppendResponse {
             term: state.current_term,
@@ -868,12 +1015,16 @@ fn handle_append_entries(
         });
     }
 
-    if prev_log_index > 0 {
-        let existing_term = state
-            .log
-            .get(prev_log_index as usize)
-            .map(|entry| entry.term)
-            .unwrap_or(0);
+    if prev_log_index == state.snapshot_index {
+        if state.snapshot_index > 0 && prev_log_term != state.snapshot_term {
+            return Ok(AppendResponse {
+                term: state.current_term,
+                success: false,
+                match_index: state.snapshot_index,
+            });
+        }
+    } else if prev_log_index > 0 {
+        let existing_term = state.entry_at(prev_log_index).map(|entry| entry.term).unwrap_or(0);
         if existing_term != prev_log_term {
             return Ok(AppendResponse {
                 term: state.current_term,
@@ -894,10 +1045,14 @@ fn handle_append_entries(
             });
         }
 
-        let idx = entry.index as usize;
-        if idx < state.log.len() {
-            if state.log[idx].term != entry.term {
-                state.log.truncate(idx);
+        if entry.index <= state.snapshot_index {
+            expected_index += 1;
+            continue;
+        }
+
+        if let Some(existing_term) = state.entry_at(entry.index).map(|existing| existing.term) {
+            if existing_term != entry.term {
+                state.log.retain(|existing| existing.index < entry.index || existing.index == 0);
                 state.log.push(entry);
                 changed = true;
             }
@@ -914,6 +1069,10 @@ fn handle_append_entries(
         changed = true;
     }
 
+    if state.commit_index >= state.snapshot_index {
+        let _ = state.maybe_snapshot();
+    }
+
     if changed || term_changed {
         state.persist()?;
     }
@@ -922,6 +1081,55 @@ fn handle_append_entries(
         term: state.current_term,
         success: true,
         match_index: state.last_log_index(),
+    })
+}
+
+fn handle_install_snapshot(
+    state: &Arc<Mutex<NodeState>>,
+    term: u64,
+    leader_id: u64,
+    last_included_index: u64,
+    last_included_term: u64,
+    snapshot: SnapshotData,
+) -> Result<InstallSnapshotResponse> {
+    let mut state = state.lock().unwrap();
+    if term < state.current_term {
+        return Ok(InstallSnapshotResponse {
+            term: state.current_term,
+            success: false,
+            last_included_index: state.snapshot_index,
+        });
+    }
+
+    if term > state.current_term || state.role != RaftRole::Follower {
+        state.step_down(term, Some(leader_id));
+    }
+
+    state.leader_id = Some(leader_id);
+    state.reset_election_deadline();
+
+    if last_included_index < state.snapshot_index {
+        return Ok(InstallSnapshotResponse {
+            term: state.current_term,
+            success: true,
+            last_included_index: state.snapshot_index,
+        });
+    }
+
+    let snapshot_state = SnapshotState {
+        last_included_index,
+        last_included_term,
+        key_values: snapshot
+            .key_values
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+    };
+    state.install_snapshot(snapshot_state)?;
+
+    Ok(InstallSnapshotResponse {
+        term: state.current_term,
+        success: true,
+        last_included_index: state.snapshot_index,
     })
 }
 
@@ -951,9 +1159,14 @@ fn handle_propose(
         (guard.current_term, guard.id, guard.peers.clone(), index)
     };
 
+    let config = {
+        let state = state_arc.lock().unwrap();
+        state.config.clone()
+    };
+
     let mut replicated = 1usize;
     for peer in peers {
-        if replicate_peer_with_retry(state_arc, bus, peer, term, leader_id)? {
+        if replicate_peer_with_retry(state_arc, bus, peer, term, leader_id, &config)? {
             replicated += 1;
         }
     }
@@ -970,6 +1183,7 @@ fn handle_propose(
     if replicated >= state.majority() {
         state.commit_index = index;
         state.apply_committed_entries();
+        let _ = state.maybe_snapshot();
         state.persist()?;
         let config = state.config.clone();
         drop(state);
@@ -994,71 +1208,127 @@ fn replicate_peer_with_retry(
     peer: u64,
     term: u64,
     leader_id: u64,
+    config: &RaftConfig,
 ) -> Result<bool> {
     for _ in 0..8 {
-        let (prev_index, prev_term, entries, leader_commit, current_term) = {
+        let action = {
             let state = state.lock().unwrap();
             if state.role != RaftRole::Leader || state.current_term != term {
                 return Ok(false);
             }
             let next_index = *state.next_index.get(&peer).unwrap_or(&(state.last_log_index() + 1));
-            let prev_index = next_index.saturating_sub(1);
-            let prev_term = if prev_index == 0 {
-                0
+            if next_index <= state.snapshot_index {
+                Some(ReplicationAction::InstallSnapshot {
+                    snapshot: SnapshotData {
+                        key_values: state.kv.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    },
+                    last_included_index: state.snapshot_index,
+                    last_included_term: state.snapshot_term,
+                    leader_commit: state.commit_index,
+                })
             } else {
-                state.log.get(prev_index as usize).map(|entry| entry.term).unwrap_or(0)
-            };
-            let entries = state
-                .log
-                .iter()
-                .skip(next_index as usize)
-                .cloned()
-                .collect::<Vec<_>>();
-            (
+                let prev_index = next_index.saturating_sub(1);
+                let prev_term = if prev_index == state.snapshot_index {
+                    state.snapshot_term
+                } else if prev_index == 0 {
+                    0
+                } else {
+                    state.entry_at(prev_index).map(|entry| entry.term).unwrap_or(0)
+                };
+                let entries = state
+                    .log
+                    .iter()
+                    .filter(|entry| entry.index >= next_index)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                Some(ReplicationAction::Append {
+                    prev_index,
+                    prev_term,
+                    entries,
+                    leader_commit: state.commit_index,
+                })
+            }
+        };
+
+        match action.expect("replication action") {
+            ReplicationAction::InstallSnapshot {
+                snapshot,
+                last_included_index,
+                last_included_term,
+                leader_commit,
+            } => {
+                match call_install_snapshot(
+                    bus,
+                    peer,
+                    term,
+                    leader_id,
+                    last_included_index,
+                    last_included_term,
+                    snapshot,
+                    config.rpc_timeout,
+                )? {
+                    Some(response) => {
+                        if response.term > term {
+                            let mut state = state.lock().unwrap();
+                            state.step_down(response.term, None);
+                            state.persist()?;
+                            return Ok(false);
+                        }
+                        if response.success {
+                            let mut state = state.lock().unwrap();
+                            state.next_index.insert(peer, response.last_included_index + 1);
+                            state.match_index.insert(peer, response.last_included_index);
+                            if leader_commit > state.commit_index {
+                                state.commit_index = leader_commit;
+                            }
+                            return Ok(true);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            ReplicationAction::Append {
                 prev_index,
                 prev_term,
                 entries,
-                state.commit_index,
-                state.current_term,
-            )
-        };
-
-        if current_term != term {
-            return Ok(false);
-        }
-
-        match call_append_entries(
-            bus,
-            peer,
-            term,
-            leader_id,
-            prev_index,
-            prev_term,
-            entries,
-            leader_commit,
-            Duration::from_millis(250),
-        )? {
-            Some(response) => {
-                if response.term > term {
-                    let mut state = state.lock().unwrap();
-                    state.step_down(response.term, None);
-                    state.persist()?;
-                    return Ok(false);
+                leader_commit,
+            } => {
+                match call_append_entries(
+                    bus,
+                    peer,
+                    term,
+                    leader_id,
+                    prev_index,
+                    prev_term,
+                    entries,
+                    leader_commit,
+                    config.rpc_timeout,
+                )? {
+                    Some(response) => {
+                        if response.term > term {
+                            let mut state = state.lock().unwrap();
+                            state.step_down(response.term, None);
+                            state.persist()?;
+                            return Ok(false);
+                        }
+                        if response.success {
+                            let mut state = state.lock().unwrap();
+                            state.next_index.insert(peer, response.match_index + 1);
+                            state.match_index.insert(peer, response.match_index);
+                            return Ok(true);
+                        }
+                        let mut state = state.lock().unwrap();
+                        let current_next = state.next_index.get(&peer).copied().unwrap_or(1);
+                        let floor = state.snapshot_index.saturating_add(1).max(1);
+                        state.next_index.insert(peer, current_next.saturating_sub(1).max(floor));
+                    }
+                    None => {
+                        let mut state = state.lock().unwrap();
+                        let current_next = state.next_index.get(&peer).copied().unwrap_or(1);
+                        let floor = state.snapshot_index.saturating_add(1).max(1);
+                        state.next_index.insert(peer, current_next.saturating_sub(1).max(floor));
+                    }
                 }
-                if response.success {
-                    let mut state = state.lock().unwrap();
-                    state.next_index.insert(peer, response.match_index + 1);
-                    state.match_index.insert(peer, response.match_index);
-                    return Ok(true);
-                }
-                let mut state = state.lock().unwrap();
-                let current_next = state.next_index.get(&peer).copied().unwrap_or(1);
-                state.next_index.insert(peer, current_next.saturating_sub(1).max(1));
-            }
-            None => {
-                let mut state = state.lock().unwrap();
-                let current_next = state.next_index.get(&peer).copied().unwrap_or(1);
-                state.next_index.insert(peer, current_next.saturating_sub(1).max(1));
             }
         }
     }
@@ -1072,57 +1342,10 @@ fn replicate_peer_from_state(
     peer: u64,
     term: u64,
     leader_id: u64,
-    last_log_index: u64,
+    _last_log_index: u64,
     config: &RaftConfig,
 ) -> Result<bool> {
-    let (prev_index, prev_term, entries, leader_commit) = {
-        let state = state.lock().unwrap();
-        let next_index = *state.next_index.get(&peer).unwrap_or(&(last_log_index + 1));
-        let prev_index = next_index.saturating_sub(1);
-        let prev_term = if prev_index == 0 {
-            0
-        } else {
-            state.log.get(prev_index as usize).map(|entry| entry.term).unwrap_or(0)
-        };
-        let entries = state
-            .log
-            .iter()
-            .skip(next_index as usize)
-            .cloned()
-            .collect::<Vec<_>>();
-        (prev_index, prev_term, entries, state.commit_index)
-    };
-
-    match call_append_entries(
-        bus,
-        peer,
-        term,
-        leader_id,
-        prev_index,
-        prev_term,
-        entries,
-        leader_commit,
-        config.rpc_timeout,
-    )? {
-        Some(response) => {
-            let mut state = state.lock().unwrap();
-            if response.term > term {
-                state.step_down(response.term, None);
-                state.persist()?;
-                return Ok(false);
-            }
-            if response.success {
-                state.next_index.insert(peer, response.match_index + 1);
-                state.match_index.insert(peer, response.match_index);
-                return Ok(true);
-            }
-            let current_next = state.next_index.get(&peer).copied().unwrap_or(1);
-            state.next_index.insert(peer, current_next.saturating_sub(1).max(1));
-            state.persist()?;
-            Ok(false)
-        }
-        None => Ok(false),
-    }
+    replicate_peer_with_retry(state, bus, peer, term, leader_id, config)
 }
 
 fn call_request_vote(
@@ -1189,6 +1412,38 @@ fn call_append_entries(
     }
 }
 
+fn call_install_snapshot(
+    bus: &Arc<ClusterBus>,
+    peer: u64,
+    term: u64,
+    leader_id: u64,
+    last_included_index: u64,
+    last_included_term: u64,
+    snapshot: SnapshotData,
+    timeout: Duration,
+) -> Result<Option<InstallSnapshotResponse>> {
+    let (respond_to, response_rx) = mpsc::channel();
+    if !bus.send(
+        peer,
+        Rpc::InstallSnapshot {
+            term,
+            leader_id,
+            last_included_index,
+            last_included_term,
+            snapshot,
+            respond_to,
+        },
+    ) {
+        return Ok(None);
+    }
+
+    match response_rx.recv_timeout(timeout) {
+        Ok(response) => Ok(Some(response)),
+        Err(RecvTimeoutError::Timeout) => Ok(None),
+        Err(RecvTimeoutError::Disconnected) => Ok(None),
+    }
+}
+
 fn randomized_timeout(id: u64, term: u64, config: &RaftConfig) -> Duration {
     let min = config.election_timeout_min.as_millis() as u64;
     let max = config.election_timeout_max.as_millis() as u64;
@@ -1214,7 +1469,15 @@ struct PersistentMeta {
 
 struct DiskState {
     meta: PersistentMeta,
+    snapshot: SnapshotState,
     log: Vec<LogEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotState {
+    last_included_index: u64,
+    last_included_term: u64,
+    key_values: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 fn persist_disk_state(
@@ -1240,8 +1503,9 @@ fn persist_disk_state(
 
 fn load_disk_state(dir: &Path) -> Result<DiskState> {
     let meta = read_meta(&dir.join("raft.meta"))?;
+    let snapshot = read_snapshot_state(&dir.join("raft.snapshot"))?;
     let log = read_log(&dir.join("raft.log"))?;
-    Ok(DiskState { meta, log })
+    Ok(DiskState { meta, snapshot, log })
 }
 
 fn write_meta(path: &Path, meta: &PersistentMeta) -> Result<()> {
@@ -1389,6 +1653,85 @@ fn read_log(path: &Path) -> Result<Vec<LogEntry>> {
     Ok(log)
 }
 
+fn persist_snapshot_state(
+    path: &Path,
+    last_included_index: u64,
+    last_included_term: u64,
+    key_values: &BTreeMap<Vec<u8>, Vec<u8>>,
+) -> Result<()> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"HRSN");
+    bytes.push(1);
+    bytes.extend_from_slice(&last_included_index.to_le_bytes());
+    bytes.extend_from_slice(&last_included_term.to_le_bytes());
+    bytes.extend_from_slice(&(key_values.len() as u64).to_le_bytes());
+
+    for (key, value) in key_values {
+        bytes.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(value);
+    }
+
+    let checksum = crc32fast::hash(&bytes);
+    bytes.extend_from_slice(&checksum.to_le_bytes());
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn read_snapshot_state(path: &Path) -> Result<SnapshotState> {
+    if !path.exists() {
+        return Ok(SnapshotState {
+            last_included_index: 0,
+            last_included_term: 0,
+            key_values: BTreeMap::new(),
+        });
+    }
+
+    let bytes = fs::read(path)?;
+    if bytes.len() < 21 {
+        return Err(DbError::Corrupt("raft snapshot too short".into()));
+    }
+
+    let checksum_offset = bytes.len() - 4;
+    let expected = u32::from_le_bytes(bytes[checksum_offset..].try_into().unwrap());
+    let actual = crc32fast::hash(&bytes[..checksum_offset]);
+    if expected != actual {
+        return Err(DbError::ChecksumMismatch("raft snapshot"));
+    }
+
+    let mut cursor = Cursor::new(&bytes[..checksum_offset]);
+    let mut magic = [0u8; 4];
+    cursor.read_exact(&mut magic)?;
+    if &magic != b"HRSN" {
+        return Err(DbError::Corrupt("invalid raft snapshot magic".into()));
+    }
+
+    let mut version = [0u8; 1];
+    cursor.read_exact(&mut version)?;
+    if version[0] != 1 {
+        return Err(DbError::Corrupt("unsupported raft snapshot version".into()));
+    }
+
+    let last_included_index = read_u64(&mut cursor)?;
+    let last_included_term = read_u64(&mut cursor)?;
+    let count = read_u64(&mut cursor)? as usize;
+    let mut key_values = BTreeMap::new();
+    for _ in 0..count {
+        let key_len = read_u32(&mut cursor)? as usize;
+        let value_len = read_u32(&mut cursor)? as usize;
+        let key = read_bytes(&mut cursor, key_len)?;
+        let value = read_bytes(&mut cursor, value_len)?;
+        key_values.insert(key, value);
+    }
+
+    Ok(SnapshotState {
+        last_included_index,
+        last_included_term,
+        key_values,
+    })
+}
+
 fn dummy_entry() -> LogEntry {
     LogEntry {
         index: 0,
@@ -1413,4 +1756,15 @@ fn read_bytes(cursor: &mut Cursor<&[u8]>, len: usize) -> Result<Vec<u8>> {
     let mut bytes = vec![0u8; len];
     cursor.read_exact(&mut bytes)?;
     Ok(bytes)
+}
+
+fn compact_log_entries(log: &[LogEntry], snapshot_index: u64) -> Vec<LogEntry> {
+    let mut compacted = Vec::with_capacity(log.len());
+    compacted.push(dummy_entry());
+    for entry in log.iter().skip(1) {
+        if entry.index > snapshot_index {
+            compacted.push(entry.clone());
+        }
+    }
+    compacted
 }
