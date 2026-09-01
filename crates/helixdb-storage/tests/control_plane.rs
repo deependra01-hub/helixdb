@@ -120,17 +120,17 @@ fn heartbeat_sweep_and_rebalance_update_placement() {
                 end: Some(b"zz".to_vec()),
                 epoch: 1,
                 raft_group_id: 7,
-                leader_hint: Some(1),
+                leader_hint: Some(99),
             },
-            vec![1, 3, 2],
+            vec![3, 1, 2],
         )
         .expect("register range");
-    assert_eq!(placement.replicas, vec![1, 3, 2]);
+    assert_eq!(placement.replicas, vec![3, 1, 2]);
 
     cp.set_last_heartbeat_for_test(1, 0).expect("age node 1");
     cp.set_last_heartbeat_for_test(2, 0).expect("age node 2");
-
-    cp.heartbeat(3).expect("refresh node 3");
+    cp.set_last_heartbeat_for_test(3, u64::MAX)
+        .expect("refresh node 3");
     cp.sweep_health().expect("sweep");
 
     assert_eq!(

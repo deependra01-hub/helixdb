@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -26,6 +27,20 @@ fn two_range_cluster(dir: &tempfile::TempDir) -> ShardedCluster {
         ],
         3,
         fast_config(),
+    )
+    .expect("bootstrap")
+}
+
+fn split_ready_cluster(dir: &tempfile::TempDir) -> ShardedCluster {
+    ShardedCluster::bootstrap_with_ranges_and_split_threshold(
+        dir.path(),
+        vec![
+            RangeDescriptor::new(1, b"a", Some(b"m"), 1, 1),
+            RangeDescriptor::new(2, b"m", None::<Vec<u8>>, 1, 2),
+        ],
+        3,
+        fast_config(),
+        2,
     )
     .expect("bootstrap")
 }
@@ -137,5 +152,67 @@ fn independent_groups_keep_working_after_one_leader_fails() {
     assert_eq!(
         cluster.get(b"zulu").expect("get zulu"),
         Some(b"cyan".to_vec())
+    );
+}
+
+#[test]
+fn hot_range_auto_splits_on_write_threshold() {
+    let dir = temp_dir();
+    let cluster = split_ready_cluster(&dir);
+
+    cluster.put(b"alpha", b"one").expect("put alpha");
+    cluster.put(b"bravo", b"two").expect("put bravo");
+    cluster.put(b"charlie", b"three").expect("put charlie");
+
+    let left = cluster.descriptor(1).expect("left descriptor");
+    assert!(left.end.is_some());
+    let right = cluster
+        .authoritative_descriptor_for_key(b"charlie")
+        .expect("right descriptor");
+    assert_ne!(right.range_id, 1);
+
+    assert_eq!(
+        cluster.get(b"alpha").expect("get alpha"),
+        Some(b"one".to_vec())
+    );
+    assert_eq!(
+        cluster.get(b"bravo").expect("get bravo"),
+        Some(b"two".to_vec())
+    );
+    assert_eq!(
+        cluster.get(b"charlie").expect("get charlie"),
+        Some(b"three".to_vec())
+    );
+}
+
+#[test]
+fn requests_continue_while_split_is_in_flight() {
+    let dir = temp_dir();
+    let cluster = Arc::new(two_range_cluster(&dir));
+
+    cluster.put(b"alpha", b"one").expect("seed alpha");
+    cluster.put(b"bravo", b"two").expect("seed bravo");
+    cluster.put(b"charlie", b"three").expect("seed charlie");
+
+    let split_cluster = Arc::clone(&cluster);
+    let handle = thread::spawn(move || {
+        split_cluster
+            .split_range_at(1, b"b")
+            .expect("explicit split");
+    });
+
+    cluster.route_put(b"delta", b"four").expect("write during split");
+    handle.join().expect("split thread");
+
+    assert_eq!(
+        cluster.get(b"delta").expect("get delta"),
+        Some(b"four".to_vec())
+    );
+    assert_ne!(
+        cluster
+            .authoritative_descriptor_for_key(b"charlie")
+            .expect("descriptor")
+            .range_id,
+        1
     );
 }

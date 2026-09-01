@@ -2,7 +2,7 @@ use crate::{DbError, RaftCluster, RaftConfig};
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use thiserror::Error;
 
@@ -83,10 +83,21 @@ impl From<DbError> for RangeRoutingError {
     }
 }
 
+#[derive(Clone)]
+struct RangeGroup {
+    cluster: Arc<RaftCluster>,
+    split_lock: Arc<RwLock<()>>,
+}
+
 pub struct ShardedCluster {
-    groups: BTreeMap<u64, RaftCluster>,
+    root: std::path::PathBuf,
+    nodes_per_group: usize,
+    raft_config: RaftConfig,
+    split_threshold_entries: usize,
+    groups: Mutex<BTreeMap<u64, RangeGroup>>,
     authoritative: Mutex<BTreeMap<u64, RangeDescriptor>>,
     cached: Mutex<BTreeMap<u64, RangeDescriptor>>,
+    next_range_id: Mutex<u64>,
 }
 
 impl ShardedCluster {
@@ -96,9 +107,30 @@ impl ShardedCluster {
         nodes_per_group: usize,
         raft_config: RaftConfig,
     ) -> ShardResult<Self> {
+        Self::bootstrap_with_ranges_and_split_threshold(
+            root,
+            descriptors,
+            nodes_per_group,
+            raft_config,
+            32,
+        )
+    }
+
+    pub fn bootstrap_with_ranges_and_split_threshold(
+        root: impl AsRef<Path>,
+        descriptors: Vec<RangeDescriptor>,
+        nodes_per_group: usize,
+        raft_config: RaftConfig,
+        split_threshold_entries: usize,
+    ) -> ShardResult<Self> {
         if nodes_per_group == 0 {
             return Err(RangeRoutingError::InvalidDescriptor(
                 "nodes_per_group must be greater than zero".into(),
+            ));
+        }
+        if split_threshold_entries == 0 {
+            return Err(RangeRoutingError::InvalidDescriptor(
+                "split_threshold_entries must be greater than zero".into(),
             ));
         }
         if descriptors.is_empty() {
@@ -114,6 +146,7 @@ impl ShardedCluster {
         let root = root.as_ref().to_path_buf();
         let mut groups = BTreeMap::new();
         let mut authoritative = BTreeMap::new();
+        let mut next_range_id = 0u64;
 
         for descriptor in descriptors {
             let group_root = root.join(format!("range-{:016}", descriptor.range_id));
@@ -130,13 +163,25 @@ impl ShardedCluster {
                     ..descriptor.clone()
                 },
             );
-            groups.insert(descriptor.range_id, cluster);
+            groups.insert(
+                descriptor.range_id,
+                RangeGroup {
+                    cluster: Arc::new(cluster),
+                    split_lock: Arc::new(RwLock::new(())),
+                },
+            );
+            next_range_id = next_range_id.max(descriptor.range_id);
         }
 
         Ok(Self {
-            groups,
+            root,
+            nodes_per_group,
+            raft_config,
+            split_threshold_entries,
+            groups: Mutex::new(groups),
             authoritative: Mutex::new(authoritative),
             cached: Mutex::new(BTreeMap::new()),
+            next_range_id: Mutex::new(next_range_id.saturating_add(1)),
         })
     }
 
@@ -235,33 +280,24 @@ impl ShardedCluster {
     }
 
     pub fn leader_id(&self, range_id: u64) -> Option<u64> {
-        self.groups
-            .get(&range_id)
-            .and_then(|cluster| cluster.leader_id())
+        self.range_group(range_id)
+            .ok()
+            .and_then(|group| group.cluster.leader_id())
     }
 
     pub fn group_leader_id(&self, range_id: u64) -> ShardResult<Option<u64>> {
-        self.groups
-            .get(&range_id)
-            .map(|cluster| cluster.leader_id())
-            .ok_or(RangeRoutingError::UnknownRange(range_id))
+        self.range_group(range_id).map(|group| group.cluster.leader_id())
     }
 
     pub fn kill_group_node(&self, range_id: u64, node_id: u64) -> ShardResult<()> {
-        let cluster = self
-            .groups
-            .get(&range_id)
-            .ok_or(RangeRoutingError::UnknownRange(range_id))?;
-        cluster.kill_node(node_id)?;
+        let group = self.range_group(range_id)?;
+        group.cluster.kill_node(node_id)?;
         Ok(())
     }
 
     pub fn restart_group_node(&self, range_id: u64, node_id: u64) -> ShardResult<()> {
-        let cluster = self
-            .groups
-            .get(&range_id)
-            .ok_or(RangeRoutingError::UnknownRange(range_id))?;
-        cluster.restart_node(node_id)?;
+        let group = self.range_group(range_id)?;
+        group.cluster.restart_node(node_id)?;
         Ok(())
     }
 
@@ -297,6 +333,52 @@ impl ShardedCluster {
         authoritative.insert(left_range_id, left);
         authoritative.insert(right_range_id, right);
         Ok(())
+    }
+
+    pub fn split_range_at(
+        &self,
+        range_id: u64,
+        boundary: impl Into<Vec<u8>>,
+    ) -> ShardResult<(RangeDescriptor, RangeDescriptor)> {
+        let group = self.range_group(range_id)?;
+        let descriptor = self.descriptor(range_id)?;
+        let _guard = group
+            .split_lock
+            .write()
+            .map_err(|_| RangeRoutingError::Internal("split lock poisoned".into()))?;
+        let entries = group.cluster.all_entries().map_err(RangeRoutingError::from)?;
+        self.split_range_at_locked_descriptor(
+            range_id,
+            boundary.into(),
+            &group,
+            descriptor,
+            entries,
+        )
+    }
+
+    pub fn split_hot_range(
+        &self,
+        range_id: u64,
+    ) -> ShardResult<(RangeDescriptor, RangeDescriptor)> {
+        let group = self.range_group(range_id)?;
+        let _guard = group
+            .split_lock
+            .write()
+            .map_err(|_| RangeRoutingError::Internal("split lock poisoned".into()))?;
+        let descriptor = self.descriptor(range_id)?;
+        let entries = group.cluster.all_entries().map_err(RangeRoutingError::from)?;
+        if entries.len() < 2 {
+            return Err(RangeRoutingError::InvalidDescriptor(
+                "range needs at least two keys before splitting".into(),
+            ));
+        }
+        let split_index = entries.len() / 2;
+        let boundary = entries
+            .keys()
+            .nth(split_index)
+            .cloned()
+            .ok_or_else(|| RangeRoutingError::Internal("failed to choose split boundary".into()))?;
+        self.split_range_at_locked_descriptor(range_id, boundary, &group, descriptor, entries)
     }
 
     pub fn route_put(&self, key: impl AsRef<[u8]>, value: impl Into<Vec<u8>>) -> ShardResult<u64> {
@@ -335,11 +417,8 @@ impl ShardedCluster {
     }
 
     pub fn group_state(&self, range_id: u64) -> ShardResult<Option<u64>> {
-        let cluster = self
-            .groups
-            .get(&range_id)
-            .ok_or(RangeRoutingError::UnknownRange(range_id))?;
-        Ok(cluster.leader_id())
+        let group = self.range_group(range_id)?;
+        Ok(group.cluster.leader_id())
     }
 
     fn cached_descriptor_for_key(&self, key: &[u8]) -> Option<RangeDescriptor> {
@@ -392,9 +471,9 @@ impl ShardedCluster {
     }
 
     fn current_leader(&self, range_id: u64) -> Option<u64> {
-        self.groups
-            .get(&range_id)
-            .and_then(|cluster| cluster.leader_id())
+        self.range_group(range_id)
+            .ok()
+            .and_then(|group| group.cluster.leader_id())
     }
 
     fn route_put_with_descriptor(
@@ -403,19 +482,25 @@ impl ShardedCluster {
         value: Vec<u8>,
         mut descriptor: RangeDescriptor,
     ) -> ShardResult<u64> {
-        self.validate_route(key, &descriptor)?;
-        let cluster = self
-            .groups
-            .get(&descriptor.range_id)
-            .ok_or(RangeRoutingError::UnknownRange(descriptor.range_id))?;
-        let index = cluster
-            .put(key.to_vec(), value)
-            .map_err(RangeRoutingError::from)?;
-        descriptor.leader_hint = cluster.leader_id();
-        self.cached
-            .lock()
-            .unwrap()
-            .insert(descriptor.range_id, descriptor);
+        let group = self.range_group(descriptor.range_id)?;
+        let index = {
+            let _guard = group
+                .split_lock
+                .read()
+                .map_err(|_| RangeRoutingError::Internal("split lock poisoned".into()))?;
+            self.validate_route(key, &descriptor)?;
+            let index = group
+                .cluster
+                .put(key.to_vec(), value)
+                .map_err(RangeRoutingError::from)?;
+            descriptor.leader_hint = group.cluster.leader_id();
+            self.cached
+                .lock()
+                .unwrap()
+                .insert(descriptor.range_id, descriptor.clone());
+            index
+        };
+        self.maybe_auto_split_range(descriptor.range_id)?;
         Ok(index)
     }
 
@@ -424,15 +509,17 @@ impl ShardedCluster {
         key: &[u8],
         mut descriptor: RangeDescriptor,
     ) -> ShardResult<u64> {
+        let group = self.range_group(descriptor.range_id)?;
+        let _guard = group
+            .split_lock
+            .read()
+            .map_err(|_| RangeRoutingError::Internal("split lock poisoned".into()))?;
         self.validate_route(key, &descriptor)?;
-        let cluster = self
-            .groups
-            .get(&descriptor.range_id)
-            .ok_or(RangeRoutingError::UnknownRange(descriptor.range_id))?;
-        let index = cluster
+        let index = group
+            .cluster
             .delete(key.to_vec())
             .map_err(RangeRoutingError::from)?;
-        descriptor.leader_hint = cluster.leader_id();
+        descriptor.leader_hint = group.cluster.leader_id();
         self.cached
             .lock()
             .unwrap()
@@ -445,19 +532,41 @@ impl ShardedCluster {
         key: &[u8],
         descriptor: RangeDescriptor,
     ) -> ShardResult<Option<Vec<u8>>> {
+        let group = self.range_group(descriptor.range_id)?;
+        let _guard = group
+            .split_lock
+            .read()
+            .map_err(|_| RangeRoutingError::Internal("split lock poisoned".into()))?;
         self.validate_route(key, &descriptor)?;
-        let cluster = self
-            .groups
-            .get(&descriptor.range_id)
-            .ok_or(RangeRoutingError::UnknownRange(descriptor.range_id))?;
-        let value = cluster.get(key.to_vec()).map_err(RangeRoutingError::from)?;
+        let value = group
+            .cluster
+            .get(key.to_vec())
+            .map_err(RangeRoutingError::from)?;
         let mut refreshed = descriptor.clone();
-        refreshed.leader_hint = cluster.leader_id();
+        refreshed.leader_hint = group.cluster.leader_id();
         self.cached
             .lock()
             .unwrap()
             .insert(refreshed.range_id, refreshed);
         Ok(value)
+    }
+
+    fn maybe_auto_split_range(&self, range_id: u64) -> ShardResult<()> {
+        if self.split_threshold_entries == 0 {
+            return Ok(());
+        }
+        let group = self.range_group(range_id)?;
+        let _guard = group
+            .split_lock
+            .read()
+            .map_err(|_| RangeRoutingError::Internal("split lock poisoned".into()))?;
+        let entries = group.cluster.all_entries().map_err(RangeRoutingError::from)?;
+        if entries.len() <= self.split_threshold_entries {
+            return Ok(());
+        }
+        drop(_guard);
+        let _ = self.split_hot_range(range_id)?;
+        Ok(())
     }
 
     fn validate_route(&self, key: &[u8], descriptor: &RangeDescriptor) -> ShardResult<()> {
@@ -544,6 +653,117 @@ impl ShardedCluster {
             .unwrap()
             .insert(descriptor.range_id, descriptor.clone());
         Ok(descriptor)
+    }
+
+    fn range_group(&self, range_id: u64) -> ShardResult<RangeGroup> {
+        self.groups
+            .lock()
+            .unwrap()
+            .get(&range_id)
+            .cloned()
+            .ok_or(RangeRoutingError::UnknownRange(range_id))
+    }
+
+    fn next_split_range_id(&self) -> u64 {
+        let mut next = self.next_range_id.lock().unwrap();
+        let range_id = *next;
+        *next = range_id.saturating_add(1);
+        range_id
+    }
+
+    fn split_range_at_locked_descriptor(
+        &self,
+        range_id: u64,
+        boundary: Vec<u8>,
+        group: &RangeGroup,
+        descriptor: RangeDescriptor,
+        entries: BTreeMap<Vec<u8>, Vec<u8>>,
+    ) -> ShardResult<(RangeDescriptor, RangeDescriptor)> {
+        if boundary <= descriptor.start {
+            return Err(RangeRoutingError::InvalidDescriptor(
+                "split boundary must be inside the range".into(),
+            ));
+        }
+        if let Some(end) = &descriptor.end {
+            if boundary >= *end {
+                return Err(RangeRoutingError::InvalidDescriptor(
+                    "split boundary must be before range end".into(),
+                ));
+            }
+        }
+
+        let mut left_items = Vec::new();
+        let mut right_items = Vec::new();
+        for (key, value) in entries {
+            if key < boundary {
+                left_items.push((key, value));
+            } else {
+                right_items.push((key, value));
+            }
+        }
+
+        if left_items.is_empty() || right_items.is_empty() {
+            return Err(RangeRoutingError::InvalidDescriptor(
+                "split boundary must divide the keys".into(),
+            ));
+        }
+
+        let new_range_id = self.next_split_range_id();
+        let right_root = self.root.join(format!("range-{:016}", new_range_id));
+        let right_cluster = Arc::new(RaftCluster::bootstrap_with_config(
+            &right_root,
+            self.nodes_per_group,
+            self.raft_config.clone(),
+        )?);
+
+        for (key, value) in &right_items {
+            right_cluster.put(key.clone(), value.clone())?;
+        }
+        for (key, _) in &right_items {
+            group.cluster.delete(key.clone())?;
+        }
+
+        let left_descriptor = RangeDescriptor {
+            range_id,
+            start: descriptor.start.clone(),
+            end: Some(boundary.clone()),
+            epoch: descriptor.epoch + 1,
+            raft_group_id: descriptor.raft_group_id,
+            leader_hint: group.cluster.leader_id(),
+        };
+        let right_descriptor = RangeDescriptor {
+            range_id: new_range_id,
+            start: boundary.clone(),
+            end: descriptor.end.clone(),
+            epoch: descriptor.epoch + 1,
+            raft_group_id: new_range_id,
+            leader_hint: right_cluster.leader_id(),
+        };
+
+        {
+            let mut authoritative = self.authoritative.lock().unwrap();
+            authoritative.insert(range_id, left_descriptor.clone());
+            authoritative.insert(new_range_id, right_descriptor.clone());
+        }
+
+        {
+            let mut groups = self.groups.lock().unwrap();
+            groups.insert(
+                new_range_id,
+                RangeGroup {
+                    cluster: right_cluster,
+                    split_lock: Arc::new(RwLock::new(())),
+                },
+            );
+        }
+
+        {
+            let mut cache = self.cached.lock().unwrap();
+            cache.insert(range_id, left_descriptor.clone());
+            cache.insert(new_range_id, right_descriptor.clone());
+        }
+
+        Ok((left_descriptor, right_descriptor))
     }
 }
 
