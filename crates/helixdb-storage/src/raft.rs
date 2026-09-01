@@ -209,6 +209,7 @@ pub struct RaftCluster {
 
 #[derive(Debug)]
 struct ClusterInner {
+    root: PathBuf,
     config: RaftConfig,
     bus: Arc<ClusterBus>,
     specs: BTreeMap<u64, NodeSpec>,
@@ -282,6 +283,7 @@ impl RaftCluster {
 
         Ok(Self {
             inner: Mutex::new(ClusterInner {
+                root,
                 config,
                 bus,
                 specs,
@@ -420,6 +422,108 @@ impl RaftCluster {
         Ok(())
     }
 
+    pub fn add_node(&self, id: u64) -> Result<()> {
+        let (dir, peers, config, bus, snapshot, log, current_term, voted_for, commit_index) = {
+            let inner = self.inner.lock().unwrap();
+            if inner.nodes.contains_key(&id) || inner.specs.contains_key(&id) {
+                return Err(DbError::Corrupt(format!("raft node {id} already exists")));
+            }
+
+            let leader_id = inner
+                .nodes
+                .iter()
+                .find_map(|(node_id, handle)| {
+                    let state = handle.state.lock().unwrap();
+                    (state.role == RaftRole::Leader).then_some(*node_id)
+                })
+                .or_else(|| inner.nodes.keys().copied().next())
+                .ok_or_else(|| DbError::Corrupt("raft cluster is empty".into()))?;
+
+            let leader_handle = inner
+                .nodes
+                .get(&leader_id)
+                .ok_or_else(|| DbError::Corrupt("raft leader missing".into()))?;
+            let leader_state = leader_handle.state.lock().unwrap();
+            let dir = inner.root.join(format!("node-{id:02}"));
+            let peers = inner
+                .nodes
+                .keys()
+                .copied()
+                .filter(|peer| *peer != id)
+                .collect::<Vec<_>>();
+            let snapshot = SnapshotState {
+                last_included_index: leader_state.snapshot_index,
+                last_included_term: leader_state.snapshot_term,
+                key_values: leader_state.kv.clone(),
+            };
+            (
+                dir,
+                peers,
+                inner.config.clone(),
+                inner.bus.clone(),
+                snapshot,
+                leader_state.log.clone(),
+                leader_state.current_term,
+                leader_state.voted_for,
+                leader_state.commit_index,
+            )
+        };
+
+        fs::create_dir_all(&dir)?;
+        persist_snapshot_state(
+            &dir.join("raft.snapshot"),
+            snapshot.last_included_index,
+            snapshot.last_included_term,
+            &snapshot.key_values,
+        )?;
+        persist_disk_state(&dir, current_term, voted_for, commit_index, &log)?;
+
+        let (tx, rx) = mpsc::channel();
+        bus.register(id, tx.clone());
+        let state = Arc::new(Mutex::new(NodeState::open(
+            id,
+            dir.clone(),
+            peers,
+            config.clone(),
+        )?));
+        let join = spawn_node_thread(id, dir.clone(), config.clone(), state.clone(), rx, bus.clone());
+
+        let mut inner = self.inner.lock().unwrap();
+        inner.specs.insert(id, NodeSpec { id, dir });
+        inner.nodes.insert(
+            id,
+            NodeHandle {
+                state,
+                tx,
+                join: Some(join),
+            },
+        );
+        Self::refresh_membership_locked(&mut inner, id);
+        Ok(())
+    }
+
+    pub fn remove_node(&self, id: u64) -> Result<()> {
+        let handle = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.specs.remove(&id);
+            inner.bus.remove(id);
+            let handle = inner.nodes.remove(&id);
+            Self::refresh_membership_locked(&mut inner, id);
+            handle
+        };
+
+        let Some(mut handle) = handle else {
+            return Err(DbError::Corrupt(format!("raft node {id} not running")));
+        };
+
+        let _ = handle.tx.send(Rpc::Shutdown);
+        if let Some(join) = handle.join.take() {
+            let _ = join.join();
+        }
+
+        Ok(())
+    }
+
     fn propose_to(&self, leader_id: u64, command: Command) -> Result<u64> {
         let inner = self.inner.lock().unwrap();
         let handle = inner
@@ -472,6 +576,27 @@ impl RaftCluster {
                     thread::sleep(Duration::from_millis(25));
                 }
             }
+        }
+    }
+
+    fn refresh_membership_locked(inner: &mut ClusterInner, changed_id: u64) {
+        let active_ids = inner.nodes.keys().copied().collect::<Vec<_>>();
+        for (id, handle) in inner.nodes.iter() {
+            let mut state = handle.state.lock().unwrap();
+            state.peers = active_ids
+                .iter()
+                .copied()
+                .filter(|peer| *peer != *id)
+                .collect();
+            if state.role == RaftRole::Leader {
+                let next = state.last_log_index().saturating_add(1);
+                state.next_index.insert(changed_id, next);
+                state.match_index.insert(changed_id, 0);
+            } else {
+                state.next_index.remove(&changed_id);
+                state.match_index.remove(&changed_id);
+            }
+            let _ = state.persist();
         }
     }
 }

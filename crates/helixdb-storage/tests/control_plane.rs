@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use helixdb_storage::{
     ControlPlane, ControlPlaneConfig, ControlPlaneError, NodeStatus, RaftConfig, RangeDescriptor,
@@ -168,4 +168,60 @@ fn range_registration_rejects_unknown_replicas() {
         .expect_err("unknown replica");
 
     assert!(matches!(err, ControlPlaneError::UnknownNode(9)));
+}
+
+#[test]
+fn add_and_remove_replica_keeps_cluster_serving() {
+    let dir = temp_dir();
+    let mut cp = bootstrap_control_plane(&dir);
+
+    cp.metadata_cluster()
+        .put(
+            format!("range/{:016}", 1).into_bytes(),
+            b"1|61|6d|1|1|-|1,2,3".to_vec(),
+        )
+        .expect("seed placement metadata");
+    cp.refresh_from_metadata().expect("refresh");
+    cp.register_node(4, 100).expect("register node 4");
+
+    cp.route_put(b"apple", b"red").expect("seed apple");
+
+    let added = cp.add_replica(1, 4).expect("add replica");
+    assert_eq!(added.replicas, vec![1, 2, 3, 4]);
+
+    wait_for_node_kv_len(&cp, 1, 4, 1).expect("node 4 catch up");
+
+    cp.route_put(b"apricot", b"gold").expect("write while added");
+    wait_for_node_kv_len(&cp, 1, 4, 2).expect("node 4 replicated writes");
+
+    let removed = cp.remove_replica(1, 4).expect("remove replica");
+    assert_eq!(removed.replicas, vec![1, 2, 3]);
+    assert!(cp.data_cluster().node_state(1, 4).expect("node state").is_none());
+
+    cp.route_put(b"banana", b"yellow")
+        .expect("write after removal");
+    assert_eq!(
+        cp.route_get(b"banana").expect("get banana"),
+        Some(b"yellow".to_vec())
+    );
+}
+
+fn wait_for_node_kv_len(
+    cp: &ControlPlane,
+    range_id: u64,
+    node_id: u64,
+    min_len: usize,
+) -> Option<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(Some(state)) = cp.data_cluster().node_state(range_id, node_id) {
+            if state.kv_len >= min_len {
+                return Some(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

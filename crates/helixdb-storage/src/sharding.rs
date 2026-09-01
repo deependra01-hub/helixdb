@@ -1,4 +1,4 @@
-use crate::{DbError, RaftCluster, RaftConfig};
+use crate::{DbError, RaftCluster, RaftConfig, RaftNodeState};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -299,6 +299,31 @@ impl ShardedCluster {
         let group = self.range_group(range_id)?;
         group.cluster.restart_node(node_id)?;
         Ok(())
+    }
+
+    pub fn add_group_node(&self, range_id: u64, node_id: u64) -> ShardResult<RangeDescriptor> {
+        let group = self.range_group(range_id)?;
+        let _guard = group
+            .split_lock
+            .write()
+            .map_err(|_| RangeRoutingError::Internal("split lock poisoned".into()))?;
+        group.cluster.add_node(node_id)?;
+        self.bump_descriptor_after_membership_change(range_id)
+    }
+
+    pub fn remove_group_node(&self, range_id: u64, node_id: u64) -> ShardResult<RangeDescriptor> {
+        let group = self.range_group(range_id)?;
+        let _guard = group
+            .split_lock
+            .write()
+            .map_err(|_| RangeRoutingError::Internal("split lock poisoned".into()))?;
+        group.cluster.remove_node(node_id)?;
+        self.bump_descriptor_after_membership_change(range_id)
+    }
+
+    pub fn node_state(&self, range_id: u64, node_id: u64) -> ShardResult<Option<RaftNodeState>> {
+        let group = self.range_group(range_id)?;
+        Ok(group.cluster.node_state(node_id))
     }
 
     pub fn move_boundary(
@@ -764,6 +789,24 @@ impl ShardedCluster {
         }
 
         Ok((left_descriptor, right_descriptor))
+    }
+
+    fn bump_descriptor_after_membership_change(
+        &self,
+        range_id: u64,
+    ) -> ShardResult<RangeDescriptor> {
+        let mut authoritative = self.authoritative.lock().unwrap();
+        let descriptor = authoritative
+            .get_mut(&range_id)
+            .ok_or(RangeRoutingError::UnknownRange(range_id))?;
+        descriptor.epoch += 1;
+        descriptor.leader_hint = self.current_leader(range_id);
+        let updated = descriptor.clone();
+        self.cached
+            .lock()
+            .unwrap()
+            .insert(range_id, updated.clone());
+        Ok(updated)
     }
 }
 

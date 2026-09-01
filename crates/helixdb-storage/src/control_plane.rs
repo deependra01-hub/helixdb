@@ -227,6 +227,55 @@ impl ControlPlane {
         Ok(placement)
     }
 
+    pub fn add_replica(
+        &self,
+        range_id: u64,
+        node_id: u64,
+    ) -> ControlPlaneResult<RangePlacement> {
+        self.ensure_registered_node(node_id)?;
+        let mut ranges = self.ranges.lock().unwrap();
+        let placement = ranges
+            .get_mut(&range_id)
+            .ok_or(ControlPlaneError::UnknownRange(range_id))?;
+        if !placement.replicas.contains(&node_id) {
+            placement.replicas.push(node_id);
+            placement.replicas.sort_unstable();
+        }
+        let descriptor = self.data.add_group_node(range_id, node_id)?;
+        placement.descriptor = descriptor;
+        let snapshot = placement.clone();
+        drop(ranges);
+        self.persist_range(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    pub fn remove_replica(
+        &self,
+        range_id: u64,
+        node_id: u64,
+    ) -> ControlPlaneResult<RangePlacement> {
+        let mut ranges = self.ranges.lock().unwrap();
+        let placement = ranges
+            .get_mut(&range_id)
+            .ok_or(ControlPlaneError::UnknownRange(range_id))?;
+        if !placement.replicas.contains(&node_id) {
+            return Err(ControlPlaneError::UnknownNode(node_id));
+        }
+        if placement.replicas.len() <= 1 {
+            return Err(ControlPlaneError::InvalidRecord(
+                "range must keep at least one replica".into(),
+            ));
+        }
+
+        placement.replicas.retain(|replica| *replica != node_id);
+        let descriptor = self.data.remove_group_node(range_id, node_id)?;
+        placement.descriptor = descriptor;
+        let snapshot = placement.clone();
+        drop(ranges);
+        self.persist_range(&snapshot)?;
+        Ok(snapshot)
+    }
+
     pub fn rebalance(&self) -> ControlPlaneResult<usize> {
         self.sweep_health()?;
         let healthy_nodes = self.healthy_nodes();
@@ -368,6 +417,14 @@ impl ControlPlane {
             self.persist_range(&placement)?;
         }
         Ok(())
+    }
+
+    fn ensure_registered_node(&self, node_id: u64) -> ControlPlaneResult<()> {
+        if self.nodes.lock().unwrap().contains_key(&node_id) {
+            Ok(())
+        } else {
+            Err(ControlPlaneError::UnknownNode(node_id))
+        }
     }
 
     fn load_from_metadata(&mut self) -> ControlPlaneResult<()> {
