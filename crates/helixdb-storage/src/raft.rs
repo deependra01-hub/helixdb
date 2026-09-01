@@ -226,7 +226,9 @@ impl RaftCluster {
         config: RaftConfig,
     ) -> Result<Self> {
         if node_count == 0 {
-            return Err(DbError::Corrupt("raft cluster requires at least one node".into()));
+            return Err(DbError::Corrupt(
+                "raft cluster requires at least one node".into(),
+            ));
         }
 
         let root = root.as_ref().to_path_buf();
@@ -248,7 +250,11 @@ impl RaftCluster {
         let mut nodes = BTreeMap::new();
         for id in 1..=node_count as u64 {
             let spec = specs.get(&id).unwrap();
-            let peers = specs.keys().copied().filter(|peer| *peer != id).collect::<Vec<_>>();
+            let peers = specs
+                .keys()
+                .copied()
+                .filter(|peer| *peer != id)
+                .collect::<Vec<_>>();
             let (tx, rx) = receivers.remove(&id).expect("receiver");
             let state = Arc::new(Mutex::new(NodeState::open(
                 spec.id,
@@ -303,7 +309,9 @@ impl RaftCluster {
                 return Ok(id);
             }
             if Instant::now() >= deadline {
-                return Err(DbError::Corrupt("no raft leader elected within timeout".into()));
+                return Err(DbError::Corrupt(
+                    "no raft leader elected within timeout".into(),
+                ));
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -326,6 +334,16 @@ impl RaftCluster {
             .ok_or_else(|| DbError::Corrupt("raft leader missing".into()))?;
         let state = handle.state.lock().unwrap();
         Ok(state.kv.get(key.as_ref()).cloned())
+    }
+
+    pub fn all_entries(&self) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+        let inner = self.inner.lock().unwrap();
+        if let Some((_, handle)) = inner.nodes.iter().next() {
+            let state = handle.state.lock().unwrap();
+            return Ok(state.kv.clone());
+        }
+
+        Ok(BTreeMap::new())
     }
 
     pub fn node_state(&self, id: u64) -> Option<RaftNodeState> {
@@ -372,12 +390,22 @@ impl RaftCluster {
                 .copied()
                 .filter(|peer| *peer != id)
                 .collect::<Vec<_>>();
-            (spec.dir.clone(), peers, inner.config.clone(), inner.bus.clone())
+            (
+                spec.dir.clone(),
+                peers,
+                inner.config.clone(),
+                inner.bus.clone(),
+            )
         };
 
         let (tx, rx) = mpsc::channel();
         bus.register(id, tx.clone());
-        let state = Arc::new(Mutex::new(NodeState::open(id, spec.clone(), peers, config.clone())?));
+        let state = Arc::new(Mutex::new(NodeState::open(
+            id,
+            spec.clone(),
+            peers,
+            config.clone(),
+        )?));
         let join = spawn_node_thread(id, spec.clone(), config, state.clone(), rx, bus.clone());
 
         let mut inner = self.inner.lock().unwrap();
@@ -399,7 +427,14 @@ impl RaftCluster {
             .get(&leader_id)
             .ok_or_else(|| DbError::Corrupt("raft leader missing".into()))?;
         let (respond_to, response_rx) = mpsc::channel();
-        if !handle.tx.send(Rpc::Propose { command, respond_to }).is_ok() {
+        if !handle
+            .tx
+            .send(Rpc::Propose {
+                command,
+                respond_to,
+            })
+            .is_ok()
+        {
             return Err(DbError::Corrupt("raft leader is unavailable".into()));
         }
         let response = response_rx
@@ -509,9 +544,7 @@ impl NodeState {
             last_applied: self.last_applied,
             snapshot_index: self.snapshot_index,
             snapshot_term: self.snapshot_term,
-            log_len: self
-                .last_log_index()
-                .saturating_sub(self.snapshot_index) as usize,
+            log_len: self.last_log_index().saturating_sub(self.snapshot_index) as usize,
             kv_len: self.kv.len(),
         }
     }
@@ -524,7 +557,10 @@ impl NodeState {
         if self.log.len() <= 1 {
             self.snapshot_index
         } else {
-            self.log.last().map(|entry| entry.index).unwrap_or(self.snapshot_index)
+            self.log
+                .last()
+                .map(|entry| entry.index)
+                .unwrap_or(self.snapshot_index)
         }
     }
 
@@ -532,7 +568,10 @@ impl NodeState {
         if self.log.len() <= 1 {
             self.snapshot_term
         } else {
-            self.log.last().map(|entry| entry.term).unwrap_or(self.snapshot_term)
+            self.log
+                .last()
+                .map(|entry| entry.term)
+                .unwrap_or(self.snapshot_term)
         }
     }
 
@@ -545,7 +584,8 @@ impl NodeState {
     }
 
     fn reset_election_deadline(&mut self) {
-        self.election_deadline = Instant::now() + randomized_timeout(self.id, self.current_term, &self.config);
+        self.election_deadline =
+            Instant::now() + randomized_timeout(self.id, self.current_term, &self.config);
     }
 
     fn clear_leader_tracking(&mut self) {
@@ -687,7 +727,12 @@ impl NodeState {
         if self.commit_index < self.snapshot_index {
             self.commit_index = self.snapshot_index;
         }
-        persist_snapshot_state(&snapshot_path, snapshot_index, snapshot_term, &snapshot_key_values)?;
+        persist_snapshot_state(
+            &snapshot_path,
+            snapshot_index,
+            snapshot_term,
+            &snapshot_key_values,
+        )?;
         self.persist()?;
         Ok(())
     }
@@ -738,13 +783,8 @@ fn run_node(
                 last_log_term,
                 respond_to,
             }) => {
-                let response = handle_request_vote(
-                    &state,
-                    term,
-                    candidate_id,
-                    last_log_index,
-                    last_log_term,
-                )?;
+                let response =
+                    handle_request_vote(&state, term, candidate_id, last_log_index, last_log_term)?;
                 let _ = respond_to.send(response);
             }
             Ok(Rpc::AppendEntries {
@@ -916,11 +956,7 @@ fn send_heartbeats(
         if state.role != RaftRole::Leader {
             return Ok(());
         }
-        (
-            state.current_term,
-            state.id,
-            state.peers.clone(),
-        )
+        (state.current_term, state.id, state.peers.clone())
     };
 
     for peer in peers {
@@ -1024,7 +1060,10 @@ fn handle_append_entries(
             });
         }
     } else if prev_log_index > 0 {
-        let existing_term = state.entry_at(prev_log_index).map(|entry| entry.term).unwrap_or(0);
+        let existing_term = state
+            .entry_at(prev_log_index)
+            .map(|entry| entry.term)
+            .unwrap_or(0);
         if existing_term != prev_log_term {
             return Ok(AppendResponse {
                 term: state.current_term,
@@ -1052,7 +1091,9 @@ fn handle_append_entries(
 
         if let Some(existing_term) = state.entry_at(entry.index).map(|existing| existing.term) {
             if existing_term != entry.term {
-                state.log.retain(|existing| existing.index < entry.index || existing.index == 0);
+                state
+                    .log
+                    .retain(|existing| existing.index < entry.index || existing.index == 0);
                 state.log.push(entry);
                 changed = true;
             }
@@ -1119,10 +1160,7 @@ fn handle_install_snapshot(
     let snapshot_state = SnapshotState {
         last_included_index,
         last_included_term,
-        key_values: snapshot
-            .key_values
-            .into_iter()
-            .collect::<BTreeMap<_, _>>(),
+        key_values: snapshot.key_values.into_iter().collect::<BTreeMap<_, _>>(),
     };
     state.install_snapshot(snapshot_state)?;
 
@@ -1216,11 +1254,18 @@ fn replicate_peer_with_retry(
             if state.role != RaftRole::Leader || state.current_term != term {
                 return Ok(false);
             }
-            let next_index = *state.next_index.get(&peer).unwrap_or(&(state.last_log_index() + 1));
+            let next_index = *state
+                .next_index
+                .get(&peer)
+                .unwrap_or(&(state.last_log_index() + 1));
             if next_index <= state.snapshot_index {
                 Some(ReplicationAction::InstallSnapshot {
                     snapshot: SnapshotData {
-                        key_values: state.kv.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        key_values: state
+                            .kv
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
                     },
                     last_included_index: state.snapshot_index,
                     last_included_term: state.snapshot_term,
@@ -1233,7 +1278,10 @@ fn replicate_peer_with_retry(
                 } else if prev_index == 0 {
                     0
                 } else {
-                    state.entry_at(prev_index).map(|entry| entry.term).unwrap_or(0)
+                    state
+                        .entry_at(prev_index)
+                        .map(|entry| entry.term)
+                        .unwrap_or(0)
                 };
                 let entries = state
                     .log
@@ -1276,7 +1324,9 @@ fn replicate_peer_with_retry(
                         }
                         if response.success {
                             let mut state = state.lock().unwrap();
-                            state.next_index.insert(peer, response.last_included_index + 1);
+                            state
+                                .next_index
+                                .insert(peer, response.last_included_index + 1);
                             state.match_index.insert(peer, response.last_included_index);
                             if leader_commit > state.commit_index {
                                 state.commit_index = leader_commit;
@@ -1320,13 +1370,17 @@ fn replicate_peer_with_retry(
                         let mut state = state.lock().unwrap();
                         let current_next = state.next_index.get(&peer).copied().unwrap_or(1);
                         let floor = state.snapshot_index.saturating_add(1).max(1);
-                        state.next_index.insert(peer, current_next.saturating_sub(1).max(floor));
+                        state
+                            .next_index
+                            .insert(peer, current_next.saturating_sub(1).max(floor));
                     }
                     None => {
                         let mut state = state.lock().unwrap();
                         let current_next = state.next_index.get(&peer).copied().unwrap_or(1);
                         let floor = state.snapshot_index.saturating_add(1).max(1);
-                        state.next_index.insert(peer, current_next.saturating_sub(1).max(floor));
+                        state
+                            .next_index
+                            .insert(peer, current_next.saturating_sub(1).max(floor));
                     }
                 }
             }
@@ -1505,7 +1559,11 @@ fn load_disk_state(dir: &Path) -> Result<DiskState> {
     let meta = read_meta(&dir.join("raft.meta"))?;
     let snapshot = read_snapshot_state(&dir.join("raft.snapshot"))?;
     let log = read_log(&dir.join("raft.log"))?;
-    Ok(DiskState { meta, snapshot, log })
+    Ok(DiskState {
+        meta,
+        snapshot,
+        log,
+    })
 }
 
 fn write_meta(path: &Path, meta: &PersistentMeta) -> Result<()> {
@@ -1647,7 +1705,11 @@ fn read_log(path: &Path) -> Result<Vec<LogEntry>> {
                 )))
             }
         };
-        log.push(LogEntry { index, term, command });
+        log.push(LogEntry {
+            index,
+            term,
+            command,
+        });
     }
 
     Ok(log)

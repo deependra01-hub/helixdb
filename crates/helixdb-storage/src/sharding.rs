@@ -52,7 +52,7 @@ impl RangeDescriptor {
 pub enum RangeRoutingError {
     #[error("key is outside any known range: {0}")]
     KeyOutOfRange(String),
-    #[error("range {range_id} moved to range {current_range_id}")] 
+    #[error("range {range_id} moved to range {current_range_id}")]
     RangeMoved {
         range_id: u64,
         current_range_id: u64,
@@ -143,7 +143,13 @@ impl ShardedCluster {
     pub fn route_descriptor_for_key(&self, key: impl AsRef<[u8]>) -> ShardResult<RangeDescriptor> {
         let key = key.as_ref();
         let authoritative = self.authoritative_descriptor_for_key(key)?;
-        if let Some(cached) = self.cached.lock().unwrap().get(&authoritative.range_id).cloned() {
+        if let Some(cached) = self
+            .cached
+            .lock()
+            .unwrap()
+            .get(&authoritative.range_id)
+            .cloned()
+        {
             self.validate_cached_descriptor(key, &cached, &authoritative)?;
             return Ok(cached);
         }
@@ -229,7 +235,9 @@ impl ShardedCluster {
     }
 
     pub fn leader_id(&self, range_id: u64) -> Option<u64> {
-        self.groups.get(&range_id).and_then(|cluster| cluster.leader_id())
+        self.groups
+            .get(&range_id)
+            .and_then(|cluster| cluster.leader_id())
     }
 
     pub fn group_leader_id(&self, range_id: u64) -> ShardResult<Option<u64>> {
@@ -291,22 +299,14 @@ impl ShardedCluster {
         Ok(())
     }
 
-    pub fn route_put(
-        &self,
-        key: impl AsRef<[u8]>,
-        value: impl Into<Vec<u8>>,
-    ) -> ShardResult<u64> {
+    pub fn route_put(&self, key: impl AsRef<[u8]>, value: impl Into<Vec<u8>>) -> ShardResult<u64> {
         let key = key.as_ref().to_vec();
         let value = value.into();
         let descriptor = self.route_descriptor_for_key(&key)?;
         self.route_put_with_descriptor(&key, value, descriptor)
     }
 
-    pub fn put(
-        &self,
-        key: impl AsRef<[u8]>,
-        value: impl Into<Vec<u8>>,
-    ) -> ShardResult<u64> {
+    pub fn put(&self, key: impl AsRef<[u8]>, value: impl Into<Vec<u8>>) -> ShardResult<u64> {
         let key = key.as_ref().to_vec();
         let value = value.into();
         self.retry_put(&key, value)
@@ -392,7 +392,9 @@ impl ShardedCluster {
     }
 
     fn current_leader(&self, range_id: u64) -> Option<u64> {
-        self.groups.get(&range_id).and_then(|cluster| cluster.leader_id())
+        self.groups
+            .get(&range_id)
+            .and_then(|cluster| cluster.leader_id())
     }
 
     fn route_put_with_descriptor(
@@ -406,9 +408,14 @@ impl ShardedCluster {
             .groups
             .get(&descriptor.range_id)
             .ok_or(RangeRoutingError::UnknownRange(descriptor.range_id))?;
-        let index = cluster.put(key.to_vec(), value).map_err(RangeRoutingError::from)?;
+        let index = cluster
+            .put(key.to_vec(), value)
+            .map_err(RangeRoutingError::from)?;
         descriptor.leader_hint = cluster.leader_id();
-        self.cached.lock().unwrap().insert(descriptor.range_id, descriptor);
+        self.cached
+            .lock()
+            .unwrap()
+            .insert(descriptor.range_id, descriptor);
         Ok(index)
     }
 
@@ -422,9 +429,14 @@ impl ShardedCluster {
             .groups
             .get(&descriptor.range_id)
             .ok_or(RangeRoutingError::UnknownRange(descriptor.range_id))?;
-        let index = cluster.delete(key.to_vec()).map_err(RangeRoutingError::from)?;
+        let index = cluster
+            .delete(key.to_vec())
+            .map_err(RangeRoutingError::from)?;
         descriptor.leader_hint = cluster.leader_id();
-        self.cached.lock().unwrap().insert(descriptor.range_id, descriptor);
+        self.cached
+            .lock()
+            .unwrap()
+            .insert(descriptor.range_id, descriptor);
         Ok(index)
     }
 
@@ -441,7 +453,10 @@ impl ShardedCluster {
         let value = cluster.get(key.to_vec()).map_err(RangeRoutingError::from)?;
         let mut refreshed = descriptor.clone();
         refreshed.leader_hint = cluster.leader_id();
-        self.cached.lock().unwrap().insert(refreshed.range_id, refreshed);
+        self.cached
+            .lock()
+            .unwrap()
+            .insert(refreshed.range_id, refreshed);
         Ok(value)
     }
 
@@ -465,7 +480,8 @@ impl ShardedCluster {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| RangeRoutingError::Internal("routing retry exhausted".into())))
+        Err(last_error
+            .unwrap_or_else(|| RangeRoutingError::Internal("routing retry exhausted".into())))
     }
 
     fn retry_delete(&self, key: &[u8]) -> ShardResult<u64> {
@@ -483,7 +499,8 @@ impl ShardedCluster {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| RangeRoutingError::Internal("routing retry exhausted".into())))
+        Err(last_error
+            .unwrap_or_else(|| RangeRoutingError::Internal("routing retry exhausted".into())))
     }
 
     fn retry_get(&self, key: &[u8]) -> ShardResult<Option<Vec<u8>>> {
@@ -501,7 +518,8 @@ impl ShardedCluster {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| RangeRoutingError::Internal("routing retry exhausted".into())))
+        Err(last_error
+            .unwrap_or_else(|| RangeRoutingError::Internal("routing retry exhausted".into())))
     }
 
     fn route_put_once(&self, key: &[u8], value: Vec<u8>) -> ShardResult<u64> {

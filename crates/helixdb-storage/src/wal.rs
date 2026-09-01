@@ -122,7 +122,9 @@ fn encode_record(record: &WalRecord) -> Vec<u8> {
     out.push(if record.value.is_some() { 1 } else { 2 });
     out.extend_from_slice(&record.sequence.to_le_bytes());
     out.extend_from_slice(&(record.key.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(record.value.as_ref().map(|v| v.len()).unwrap_or(0) as u32).to_le_bytes());
+    out.extend_from_slice(
+        &(record.value.as_ref().map(|v| v.len()).unwrap_or(0) as u32).to_le_bytes(),
+    );
     out.extend_from_slice(&record.key);
     if let Some(value) = &record.value {
         out.extend_from_slice(value);
@@ -142,23 +144,31 @@ fn read_record(cursor: &mut std::io::Cursor<Vec<u8>>) -> Result<Option<WalRecord
 
     let kind = match read_u8(cursor) {
         Ok(kind) => kind,
-        Err(DbError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(DbError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(None)
+        }
         Err(err) => return Err(err),
     };
 
     let sequence = match read_u64(cursor) {
         Ok(value) => value,
-        Err(DbError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(DbError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(None)
+        }
         Err(err) => return Err(err),
     };
     let key_len = match read_u32(cursor) {
         Ok(value) => value as usize,
-        Err(DbError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(DbError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(None)
+        }
         Err(err) => return Err(err),
     };
     let value_len = match read_u32(cursor) {
         Ok(value) => value as usize,
-        Err(DbError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(DbError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(None)
+        }
         Err(err) => return Err(err),
     };
 
@@ -174,7 +184,9 @@ fn read_record(cursor: &mut std::io::Cursor<Vec<u8>>) -> Result<Option<WalRecord
 
     let checksum = match read_u32(cursor) {
         Ok(value) => value,
-        Err(DbError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(DbError::Io(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(None)
+        }
         Err(err) => return Err(err),
     };
 

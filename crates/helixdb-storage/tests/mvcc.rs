@@ -23,8 +23,14 @@ fn snapshot_reads_are_stable() {
     let snap30 = db.snapshot(30);
 
     assert_eq!(snap10.timestamp(), 10);
-    assert_eq!(db.get_at(b"acct", snap10.timestamp()).expect("get"), Some(b"v1".to_vec()));
-    assert_eq!(db.get_at(b"acct", snap20.timestamp()).expect("get"), Some(b"v2".to_vec()));
+    assert_eq!(
+        db.get_at(b"acct", snap10.timestamp()).expect("get"),
+        Some(b"v1".to_vec())
+    );
+    assert_eq!(
+        db.get_at(b"acct", snap20.timestamp()).expect("get"),
+        Some(b"v2".to_vec())
+    );
     assert_eq!(db.get_at(b"acct", snap30.timestamp()).expect("get"), None);
 }
 
@@ -54,7 +60,10 @@ fn mvcc_gc_drops_obsolete_versions() {
 fn concurrent_readers_and_writers_respect_snapshots() {
     let dir = temp_dir();
     let db = Arc::new(RwLock::new(MvccDb::open(dir.path()).expect("open")));
-    db.write().unwrap().put_at(b"counter", b"v1", 1).expect("seed");
+    db.write()
+        .unwrap()
+        .put_at(b"counter", b"v1", 1)
+        .expect("seed");
 
     let barrier = Arc::new(Barrier::new(4));
     let ready_for_reads = Arc::new(AtomicBool::new(false));
@@ -86,7 +95,11 @@ fn concurrent_readers_and_writers_respect_snapshots() {
             while !reader_ready.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(1));
             }
-            let value = reader_db.read().unwrap().get_at(b"counter", snapshot_ts).expect("get");
+            let value = reader_db
+                .read()
+                .unwrap()
+                .get_at(b"counter", snapshot_ts)
+                .expect("get");
             match snapshot_ts {
                 1 => assert_eq!(value, Some(b"v1".to_vec())),
                 3 => assert_eq!(value, Some(b"v3".to_vec())),

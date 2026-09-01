@@ -29,18 +29,26 @@ fn flush_and_compaction_preserve_latest_values() {
 
     let mut db = Db::open_with_options(dir.path(), options).expect("open");
     for i in 0..20 {
-        db.put(format!("key-{i}"), format!("value-{i}")).expect("put");
+        db.put(format!("key-{i}"), format!("value-{i}"))
+            .expect("put");
     }
     db.flush().expect("flush");
     for i in 10..30 {
-        db.put(format!("key-{i}"), format!("value-{i}-new")).expect("put");
+        db.put(format!("key-{i}"), format!("value-{i}-new"))
+            .expect("put");
     }
     db.flush().expect("flush");
     db.compact().expect("compact");
 
     assert_eq!(db.get(b"key-0").expect("get"), Some(b"value-0".to_vec()));
-    assert_eq!(db.get(b"key-15").expect("get"), Some(b"value-15-new".to_vec()));
-    assert_eq!(db.get(b"key-29").expect("get"), Some(b"value-29-new".to_vec()));
+    assert_eq!(
+        db.get(b"key-15").expect("get"),
+        Some(b"value-15-new".to_vec())
+    );
+    assert_eq!(
+        db.get(b"key-29").expect("get"),
+        Some(b"value-29-new".to_vec())
+    );
 }
 
 #[test]

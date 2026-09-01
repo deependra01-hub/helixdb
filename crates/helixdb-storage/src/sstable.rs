@@ -247,7 +247,9 @@ fn write_block(file: &mut File, entries: &[(Vec<u8>, ValueEntry)]) -> Result<u64
     payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (key, value) in entries {
         payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        payload.extend_from_slice(&(value.value.as_ref().map(|v| v.len()).unwrap_or(0) as u32).to_le_bytes());
+        payload.extend_from_slice(
+            &(value.value.as_ref().map(|v| v.len()).unwrap_or(0) as u32).to_le_bytes(),
+        );
         payload.extend_from_slice(&value.sequence.to_le_bytes());
         payload.push(if value.value.is_some() { 1 } else { 2 });
         payload.extend_from_slice(key);

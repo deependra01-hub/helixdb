@@ -1,8 +1,9 @@
 mod bloom;
+mod control_plane;
 mod error;
 mod manifest;
-mod mvcc;
 mod memtable;
+mod mvcc;
 mod raft;
 mod sharding;
 mod sstable;
@@ -10,10 +11,13 @@ mod types;
 mod wal;
 
 pub use bloom::BloomFilter;
+pub use control_plane::{
+    ControlPlane, ControlPlaneConfig, ControlPlaneError, NodeRecord, NodeStatus, RangePlacement,
+};
 pub use error::{DbError, Result};
 pub use manifest::{Manifest, SstableMeta};
-pub use mvcc::{MvccDb, Snapshot};
 pub use memtable::{ImmutableMemTable, MemTable};
+pub use mvcc::{MvccDb, Snapshot};
 pub use raft::{RaftCluster, RaftConfig, RaftNodeState, RaftRole};
 pub use sharding::{RangeDescriptor, RangeRoutingError, ShardedCluster};
 pub use sstable::{Sstable, SstableReader};
@@ -203,7 +207,11 @@ impl Db {
 
         let compacted_id = self.manifest.next_file_id;
         let compacted_path = self.dir.join(format!("sst-{compacted_id:016}.sst"));
-        let old_paths: Vec<PathBuf> = self.sstables.iter().map(|table| table.path().to_path_buf()).collect();
+        let old_paths: Vec<PathBuf> = self
+            .sstables
+            .iter()
+            .map(|table| table.path().to_path_buf())
+            .collect();
 
         let mut merged = std::collections::BTreeMap::<Vec<u8>, ValueEntry>::new();
         for table in self.sstables.iter().rev() {

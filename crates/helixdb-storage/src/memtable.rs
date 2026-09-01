@@ -22,12 +22,7 @@ impl MemTable {
             + 16;
 
         if let Some(existing) = self.entries.insert(key, new_entry) {
-            let old_size = existing
-                .value
-                .as_ref()
-                .map(|v| v.len())
-                .unwrap_or(0)
-                + 24;
+            let old_size = existing.value.as_ref().map(|v| v.len()).unwrap_or(0) + 24;
             self.approximate_bytes = self.approximate_bytes.saturating_sub(old_size);
         }
 

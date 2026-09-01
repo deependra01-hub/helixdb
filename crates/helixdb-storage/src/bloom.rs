@@ -51,7 +51,8 @@ impl BloomFilter {
         let key = key.as_ref();
         let (h1, h2) = self.hash_pair(key);
         for i in 0..self.hash_functions {
-            let idx = ((h1.wrapping_add((i as u64).wrapping_mul(h2))) % self.bit_count as u64) as usize;
+            let idx =
+                ((h1.wrapping_add((i as u64).wrapping_mul(h2))) % self.bit_count as u64) as usize;
             self.bits[idx / 8] |= 1 << (idx % 8);
         }
     }
@@ -64,7 +65,8 @@ impl BloomFilter {
         let key = key.as_ref();
         let (h1, h2) = self.hash_pair(key);
         for i in 0..self.hash_functions {
-            let idx = ((h1.wrapping_add((i as u64).wrapping_mul(h2))) % self.bit_count as u64) as usize;
+            let idx =
+                ((h1.wrapping_add((i as u64).wrapping_mul(h2))) % self.bit_count as u64) as usize;
             if self.bits[idx / 8] & (1 << (idx % 8)) == 0 {
                 return false;
             }
