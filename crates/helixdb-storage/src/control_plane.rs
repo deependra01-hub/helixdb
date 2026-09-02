@@ -9,6 +9,20 @@ use thiserror::Error;
 
 pub type ControlPlaneResult<T> = std::result::Result<T, ControlPlaneError>;
 
+const TIMESTAMP_KEY: &str = "timestamp/current";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimestampBatch {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl TimestampBatch {
+    pub fn len(&self) -> u64 {
+        self.end.saturating_sub(self.start).saturating_add(1)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
     Healthy,
@@ -88,7 +102,13 @@ pub struct ControlPlane {
     data: ShardedCluster,
     nodes: Mutex<BTreeMap<u64, NodeRecord>>,
     ranges: Mutex<BTreeMap<u64, RangePlacement>>,
+    timestamp: Mutex<TimestampOracleState>,
     config: ControlPlaneConfig,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct TimestampOracleState {
+    next_timestamp: u64,
 }
 
 impl ControlPlane {
@@ -135,6 +155,7 @@ impl ControlPlane {
             data,
             nodes: Mutex::new(BTreeMap::new()),
             ranges: Mutex::new(BTreeMap::new()),
+            timestamp: Mutex::new(TimestampOracleState::default()),
             config,
         };
 
@@ -367,6 +388,34 @@ impl ControlPlane {
         self.data.route_delete(key).map_err(Into::into)
     }
 
+    pub fn allocate_timestamp_batch(&self, count: u64) -> ControlPlaneResult<TimestampBatch> {
+        if count == 0 {
+            return Err(ControlPlaneError::InvalidRecord(
+                "timestamp batch size must be greater than zero".into(),
+            ));
+        }
+
+        let mut timestamp = self.timestamp.lock().unwrap();
+        let start = timestamp.next_timestamp.checked_add(1).ok_or_else(|| {
+            ControlPlaneError::InvalidRecord("timestamp oracle overflow".into())
+        })?;
+        let end = timestamp.next_timestamp.checked_add(count).ok_or_else(|| {
+            ControlPlaneError::InvalidRecord("timestamp oracle overflow".into())
+        })?;
+
+        self.persist_timestamp(end)?;
+        timestamp.next_timestamp = end;
+        Ok(TimestampBatch { start, end })
+    }
+
+    pub fn allocate_timestamp(&self) -> ControlPlaneResult<u64> {
+        Ok(self.allocate_timestamp_batch(1)?.start)
+    }
+
+    pub fn current_timestamp(&self) -> u64 {
+        self.timestamp.lock().unwrap().next_timestamp
+    }
+
     pub fn refresh_from_metadata(&mut self) -> ControlPlaneResult<()> {
         self.load_from_metadata()?;
         Ok(())
@@ -405,6 +454,14 @@ impl ControlPlane {
         Ok(())
     }
 
+    fn persist_timestamp(&self, timestamp: u64) -> ControlPlaneResult<()> {
+        self.metadata.put(
+            TIMESTAMP_KEY.as_bytes().to_vec(),
+            timestamp.to_le_bytes().to_vec(),
+        )?;
+        Ok(())
+    }
+
     fn persist_ranges(&self) -> ControlPlaneResult<()> {
         let ranges = self
             .ranges
@@ -431,6 +488,7 @@ impl ControlPlane {
         let entries = self.metadata.all_entries()?;
         let mut nodes = BTreeMap::new();
         let mut ranges = BTreeMap::new();
+        let mut timestamp = TimestampOracleState::default();
 
         for (key, value) in entries {
             let key_str = String::from_utf8(key)
@@ -446,11 +504,14 @@ impl ControlPlane {
                     .map_err(|_| ControlPlaneError::InvalidRecord("invalid range key".into()))?;
                 let placement = decode_range_placement(&value)?;
                 ranges.insert(range_id, placement);
+            } else if key_str == TIMESTAMP_KEY {
+                timestamp.next_timestamp = decode_timestamp(&value)?;
             }
         }
 
         *self.nodes.lock().unwrap() = nodes;
         *self.ranges.lock().unwrap() = ranges;
+        *self.timestamp.lock().unwrap() = timestamp;
         Ok(())
     }
 }
@@ -666,6 +727,18 @@ fn hex_decode(text: &str) -> ControlPlaneResult<Vec<u8>> {
         index += 2;
     }
     Ok(out)
+}
+
+fn decode_timestamp(bytes: &[u8]) -> ControlPlaneResult<u64> {
+    if bytes.len() != 8 {
+        return Err(ControlPlaneError::InvalidRecord(
+            "timestamp record must be exactly 8 bytes".into(),
+        ));
+    }
+
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(bytes);
+    Ok(u64::from_le_bytes(raw))
 }
 
 fn from_hex_digit(byte: u8) -> ControlPlaneResult<u8> {

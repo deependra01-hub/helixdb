@@ -206,6 +206,29 @@ fn add_and_remove_replica_keeps_cluster_serving() {
     );
 }
 
+#[test]
+fn timestamp_oracle_batches_are_monotonic_and_survive_leader_failover() {
+    let dir = temp_dir();
+    let cp = bootstrap_control_plane(&dir);
+
+    let first = cp.allocate_timestamp_batch(5).expect("first batch");
+    assert_eq!(first.start, 1);
+    assert_eq!(first.end, 5);
+    assert_eq!(first.len(), 5);
+    assert_eq!(cp.current_timestamp(), 5);
+
+    let leader = cp.metadata_cluster().leader_id().expect("metadata leader");
+    cp.metadata_cluster()
+        .kill_node(leader)
+        .expect("kill metadata leader");
+
+    let second = cp.allocate_timestamp_batch(3).expect("second batch");
+    assert_eq!(second.start, 6);
+    assert_eq!(second.end, 8);
+    assert_eq!(cp.allocate_timestamp().expect("single timestamp"), 9);
+    assert_eq!(cp.current_timestamp(), 9);
+}
+
 fn wait_for_node_kv_len(
     cp: &ControlPlane,
     range_id: u64,

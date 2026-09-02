@@ -13,6 +13,7 @@ mod wal;
 pub use bloom::BloomFilter;
 pub use control_plane::{
     ControlPlane, ControlPlaneConfig, ControlPlaneError, NodeRecord, NodeStatus, RangePlacement,
+    TimestampBatch,
 };
 pub use error::{DbError, Result};
 pub use manifest::{Manifest, SstableMeta};
