@@ -6,6 +6,7 @@ mod memtable;
 mod mvcc;
 mod raft;
 mod sharding;
+mod transaction;
 mod sstable;
 mod types;
 mod wal;
@@ -23,6 +24,7 @@ pub use raft::{RaftCluster, RaftConfig, RaftNodeState, RaftRole};
 pub use sharding::{RangeDescriptor, RangeRoutingError, ShardedCluster};
 pub use sstable::{Sstable, SstableReader};
 pub use types::{EntryKind, ValueEntry};
+pub use transaction::{MvccTransaction, MvccTransactionError, TransactionalMvccDb};
 pub use wal::{WalRecord, WalWriter};
 
 use std::fs;

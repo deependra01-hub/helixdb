@@ -115,6 +115,16 @@ impl MvccDb {
         versions.sort_by_key(|version| version.timestamp);
         Ok(versions)
     }
+
+    pub fn max_timestamp(&self) -> Result<u64> {
+        let mut max_timestamp = 0u64;
+        for (internal_key, _) in self.storage.all_entries()? {
+            if let Ok((_, timestamp)) = decode_internal_key(&internal_key) {
+                max_timestamp = max_timestamp.max(timestamp);
+            }
+        }
+        Ok(max_timestamp)
+    }
 }
 
 impl Snapshot {
@@ -131,7 +141,7 @@ fn encode_internal_key(key: &[u8], timestamp: u64) -> Vec<u8> {
     out
 }
 
-fn decode_internal_key(bytes: &[u8]) -> Result<(Vec<u8>, u64)> {
+pub(crate) fn decode_internal_key(bytes: &[u8]) -> Result<(Vec<u8>, u64)> {
     if bytes.len() < 12 {
         return Err(DbError::Corrupt("internal mvcc key too short".into()));
     }
